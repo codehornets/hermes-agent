@@ -5,6 +5,7 @@ Diagnoses issues with Hermes Agent setup.
 """
 
 import os
+import shlex
 import sys
 import subprocess
 import shutil
@@ -2221,13 +2222,26 @@ def run_doctor(args):
 
     if sys.platform != "win32":
         _section("Command Installation")
-        # Determine the venv entry point location
+        # Prefer the entry point beside the interpreter that is running
+        # doctor. Development installs intentionally keep their venv outside
+        # the checkout, so limiting discovery to PROJECT_ROOT/{venv,.venv}
+        # falsely reports a broken installation for the documented layout.
         _venv_bin = None
-        for _venv_name in ("venv", ".venv"):
-            _candidate = PROJECT_ROOT / _venv_name / "bin" / "hermes"
-            if _candidate.exists():
-                _venv_bin = _candidate
-                break
+        _module_root = Path(__file__).resolve().parent.parent
+        if _module_root == PROJECT_ROOT.resolve():
+            # Do not resolve sys.executable: venv Python binaries are commonly
+            # symlinks to uv's shared interpreter, while the console script is
+            # beside the symlink inside the venv.
+            _active_candidate = Path(sys.executable).parent / "hermes"
+            if _active_candidate.is_file():
+                _venv_bin = _active_candidate
+
+        if _venv_bin is None:
+            for _venv_name in ("venv", ".venv"):
+                _candidate = PROJECT_ROOT / _venv_name / "bin" / "hermes"
+                if _candidate.is_file():
+                    _venv_bin = _candidate
+                    break
 
         # Determine the expected command link directory (mirrors install.sh logic)
         _prefix = os.environ.get("PREFIX", "")
@@ -2243,13 +2257,18 @@ def run_doctor(args):
         if _venv_bin is None:
             check_warn(
                 "Venv entry point not found",
-                "(hermes not in venv/bin/ or .venv/bin/ — reinstall with pip install -e '.[all]')"
+                "(hermes not beside the active Python or in venv/bin/ or .venv/bin/)"
             )
             manual_issues.append(
-                f"Reinstall entry point: cd {PROJECT_ROOT} && source venv/bin/activate && pip install -e '.[all]'"
+                f"Reinstall entry point: cd {shlex.quote(str(PROJECT_ROOT))} && "
+                f"uv pip install --python {shlex.quote(sys.executable)} -e '.[all]'"
             )
         else:
-            check_ok(f"Venv entry point exists ({_venv_bin.relative_to(PROJECT_ROOT)})")
+            try:
+                _venv_display = _venv_bin.relative_to(PROJECT_ROOT)
+            except ValueError:
+                _venv_display = _venv_bin
+            check_ok(f"Venv entry point exists ({_venv_display})")
 
             # Check the symlink at the command link location
             if _cmd_link.is_symlink():
