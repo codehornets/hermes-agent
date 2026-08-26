@@ -323,6 +323,45 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Set the default workspace path for tasks on a board",
     )
     b_set_wd.add_argument("slug")
+    b_roster = boards_sub.add_parser(
+        "roster", help="Show or configure a board's audited profile roster",
+    )
+    b_roster.add_argument("slug")
+    b_roster.add_argument("--json", action="store_true")
+    b_roster.add_argument(
+        "--strict", action=argparse.BooleanOptionalAction, default=None,
+        help="Reject profiles not explicitly listed on the roster",
+    )
+    b_roster.add_argument(
+        "--require-review", action=argparse.BooleanOptionalAction, default=None,
+        help="Require implementation runs to enter review before completion",
+    )
+    b_roster.add_argument(
+        "--enforce-pins", action=argparse.BooleanOptionalAction, default=None,
+        help="Reject dispatch when a profile definition differs from its pin",
+    )
+
+    b_roster_add = boards_sub.add_parser(
+        "roster-add", help="Add a profile to a board role and snapshot its version",
+    )
+    b_roster_add.add_argument("slug")
+    b_roster_add.add_argument("profile")
+    b_roster_add.add_argument(
+        "--role", choices=("orchestrator", "worker", "reviewer"),
+        default="worker",
+    )
+
+    b_roster_remove = boards_sub.add_parser(
+        "roster-remove", help="Remove a profile from every role on a board",
+    )
+    b_roster_remove.add_argument("slug")
+    b_roster_remove.add_argument("profile")
+
+    b_roster_verify = boards_sub.add_parser(
+        "roster-verify", help="Verify profile existence and pinned versions",
+    )
+    b_roster_verify.add_argument("slug")
+    b_roster_verify.add_argument("--json", action="store_true")
     b_set_wd.add_argument("path", nargs="?", default=None,
                           help="Absolute path to use as default workdir. Omit to clear.")
 
@@ -1268,6 +1307,14 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
+    if sub == "roster":
+        return _cmd_boards_roster(args)
+    if sub == "roster-add":
+        return _cmd_boards_roster_add(args)
+    if sub == "roster-remove":
+        return _cmd_boards_roster_remove(args)
+    if sub == "roster-verify":
+        return _cmd_boards_roster_verify(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1441,6 +1488,112 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
     else:
         print(f"Board {normed!r} default workdir cleared.")
     return 0
+
+
+def _require_board(slug: str, command: str) -> Optional[str]:
+    try:
+        normed = kb._normalize_board_slug(slug)
+    except ValueError as exc:
+        print(f"kanban boards {command}: {exc}", file=sys.stderr)
+        return None
+    if not normed or not kb.board_exists(normed):
+        print(f"kanban boards {command}: board {slug!r} does not exist", file=sys.stderr)
+        return None
+    return normed
+
+
+def _cmd_boards_roster(args: argparse.Namespace) -> int:
+    slug = _require_board(args.slug, "roster")
+    if not slug:
+        return 1
+    meta = kb.read_board_metadata(slug)
+    policy = dict(meta["policy"])
+    changed = False
+    if args.strict is not None:
+        policy["allow_unlisted_profiles"] = not args.strict
+        changed = True
+    if args.require_review is not None:
+        policy["require_review"] = args.require_review
+        changed = True
+    if args.enforce_pins is not None:
+        policy["enforce_profile_pins"] = args.enforce_pins
+        changed = True
+    if changed:
+        meta = kb.write_board_metadata(slug, policy=policy)
+    report = kb.verify_board_roster(slug)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+    roster = report["roster"]
+    print(f"Board {slug!r} roster")
+    print(f"  Orchestrator: {roster['orchestrator'] or '(none)'}")
+    print(f"  Workers:      {', '.join(roster['workers']) or '(none)'}")
+    print(f"  Reviewers:    {', '.join(roster['reviewers']) or '(none)'}")
+    print(f"  Strict:       {not report['policy']['allow_unlisted_profiles']}")
+    print(f"  Review gate:  {report['policy']['require_review']}")
+    print(f"  Enforce pins: {report['policy']['enforce_profile_pins']}")
+    return 0
+
+
+def _cmd_boards_roster_add(args: argparse.Namespace) -> int:
+    slug = _require_board(args.slug, "roster-add")
+    if not slug:
+        return 1
+    from hermes_cli.profiles import normalize_profile_name, profile_exists
+
+    profile = normalize_profile_name(args.profile)
+    if not profile_exists(profile):
+        print(f"kanban boards roster-add: profile {profile!r} does not exist", file=sys.stderr)
+        return 1
+    meta = kb.read_board_metadata(slug)
+    roster = dict(meta["roster"])
+    roster["workers"] = list(roster["workers"])
+    roster["reviewers"] = list(roster["reviewers"])
+    if args.role == "orchestrator":
+        roster["orchestrator"] = profile
+    else:
+        key = f"{args.role}s"
+        if profile not in roster[key]:
+            roster[key].append(profile)
+    pins = dict(meta.get("profile_pins", {}))
+    pins[profile] = kb.profile_pin(profile)
+    kb.write_board_metadata(slug, roster=roster, profile_pins=pins)
+    print(f"Added {profile!r} as {args.role} on board {slug!r}; version pin recorded.")
+    return 0
+
+
+def _cmd_boards_roster_remove(args: argparse.Namespace) -> int:
+    slug = _require_board(args.slug, "roster-remove")
+    if not slug:
+        return 1
+    profile = kb._canonical_assignee(args.profile)
+    meta = kb.read_board_metadata(slug)
+    roster = dict(meta["roster"])
+    if roster["orchestrator"] == profile:
+        roster["orchestrator"] = None
+    roster["workers"] = [name for name in roster["workers"] if name != profile]
+    roster["reviewers"] = [name for name in roster["reviewers"] if name != profile]
+    pins = dict(meta.get("profile_pins", {}))
+    pins.pop(profile, None)
+    kb.write_board_metadata(slug, roster=roster, profile_pins=pins)
+    print(f"Removed {profile!r} from board {slug!r}.")
+    return 0
+
+
+def _cmd_boards_roster_verify(args: argparse.Namespace) -> int:
+    slug = _require_board(args.slug, "roster-verify")
+    if not slug:
+        return 1
+    report = kb.verify_board_roster(slug)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    elif report["ok"]:
+        print(f"Board {slug!r} roster is valid; {len(report['profiles'])} profile(s) verified.")
+    else:
+        print(f"Board {slug!r} roster has {len(report['issues'])} issue(s):")
+        for issue in report["issues"]:
+            print(f"  - {issue}")
+    return 0 if report["ok"] else 1
 
 
 # ---------------------------------------------------------------------------
@@ -1738,6 +1891,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
                     "summary": r.summary,
                     "error": r.error,
                     "metadata": r.metadata,
+                    "provenance": r.provenance,
                     "worker_pid": r.worker_pid,
                     "started_at": r.started_at,
                     "ended_at": r.ended_at,
@@ -3023,6 +3177,7 @@ def _cmd_runs(args: argparse.Namespace) -> int:
                 "outcome": r.outcome, "started_at": r.started_at,
                 "ended_at": r.ended_at, "summary": r.summary,
                 "error": r.error, "metadata": r.metadata,
+                "provenance": r.provenance,
                 "worker_pid": r.worker_pid, "step_key": r.step_key,
             } for r in runs
         ], indent=2, ensure_ascii=False))

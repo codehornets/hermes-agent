@@ -852,6 +852,15 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "project_id": None,
         "created_at": None,
         "archived": False,
+        # A missing roster is intentionally permissive for boards created by
+        # older Hermes releases. Operators opt into enforcement explicitly.
+        "roster": {"orchestrator": None, "workers": [], "reviewers": []},
+        "policy": {
+            "allow_unlisted_profiles": True,
+            "require_review": False,
+            "enforce_profile_pins": False,
+        },
+        "profile_pins": {},
     }
     try:
         p = board_metadata_path(slug)
@@ -865,7 +874,176 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
     except (OSError, json.JSONDecodeError):
         pass
     meta["db_path"] = str(kanban_db_path(slug))
+    meta["roster"] = normalize_board_roster(meta.get("roster"))
+    meta["policy"] = normalize_board_policy(meta.get("policy"))
+    if not isinstance(meta.get("profile_pins"), dict):
+        meta["profile_pins"] = {}
     return meta
+
+
+def normalize_board_roster(value: Any) -> dict[str, Any]:
+    """Return the stable board roster shape from untrusted JSON metadata."""
+    raw = value if isinstance(value, dict) else {}
+
+    def _names(key: str) -> list[str]:
+        values = raw.get(key, [])
+        if not isinstance(values, list):
+            return []
+        result: list[str] = []
+        for item in values:
+            try:
+                name = _canonical_assignee(str(item))
+            except (TypeError, ValueError):
+                continue
+            if name and name not in result:
+                result.append(name)
+        return result
+
+    orchestrator = raw.get("orchestrator")
+    try:
+        orchestrator = _canonical_assignee(str(orchestrator)) if orchestrator else None
+    except (TypeError, ValueError):
+        orchestrator = None
+    return {
+        "orchestrator": orchestrator,
+        "workers": _names("workers"),
+        "reviewers": _names("reviewers"),
+    }
+
+
+def normalize_board_policy(value: Any) -> dict[str, bool]:
+    raw = value if isinstance(value, dict) else {}
+    return {
+        "allow_unlisted_profiles": bool(raw.get("allow_unlisted_profiles", True)),
+        "require_review": bool(raw.get("require_review", False)),
+        "enforce_profile_pins": bool(raw.get("enforce_profile_pins", False)),
+    }
+
+
+def profile_provenance(profile: str, *, skills: Iterable[str] = ()) -> dict[str, Any]:
+    """Snapshot the executable profile definition without reading secrets."""
+    from hermes_cli import __version__
+    from hermes_cli.profiles import _read_config_model, _read_distribution_meta, get_profile_dir
+
+    name = _canonical_assignee(profile) or profile
+    profile_dir = get_profile_dir(name)
+    model, provider = _read_config_model(profile_dir)
+    dist_name, dist_version, dist_source = _read_distribution_meta(profile_dir)
+    digest = hashlib.sha256()
+    for filename in ("SOUL.md", "config.yaml", "distribution.yaml", "profile.yaml"):
+        path = profile_dir / filename
+        if path.is_file():
+            digest.update(filename.encode())
+            digest.update(path.read_bytes())
+    skill_versions: list[dict[str, str]] = []
+    repo = Path(__file__).resolve().parents[1]
+    for skill in sorted({str(s).strip() for s in skills if str(s).strip()}):
+        candidates = [
+            profile_dir / "skills" / skill / "SKILL.md",
+            repo / "skills" / skill / "SKILL.md",
+        ]
+        candidates.extend((repo / "skills").glob(f"*/{skill}/SKILL.md"))
+        skill_path = next((path for path in candidates if path.is_file()), None)
+        entry: dict[str, str] = {"name": skill}
+        if skill_path is not None:
+            content = skill_path.read_bytes()
+            entry["sha256"] = hashlib.sha256(content).hexdigest()
+            match = re.search(rb"(?m)^version:\s*['\"]?([^'\"\r\n]+)", content)
+            if match:
+                entry["version"] = match.group(1).decode("utf-8", "replace").strip()
+        skill_versions.append(entry)
+    try:
+        core_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,
+            text=True, timeout=2, check=False,
+        ).stdout.strip() or None
+    except Exception:
+        core_commit = None
+    return {
+        "hermes": {"version": __version__, "commit": core_commit},
+        "profile": {
+            "name": name,
+            "definition_sha256": digest.hexdigest(),
+            "distribution": {
+                "name": dist_name, "version": dist_version, "source": dist_source,
+            },
+        },
+        "model": {"name": model, "provider": provider},
+        "skills": skill_versions,
+    }
+
+
+def profile_pin(profile: str) -> dict[str, Any]:
+    snapshot = profile_provenance(profile)
+    return {
+        "distribution_version": snapshot["profile"]["distribution"]["version"],
+        "definition_sha256": snapshot["profile"]["definition_sha256"],
+    }
+
+
+def board_profile_allowed(
+    profile: Optional[str], *, role: str = "worker", board: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Evaluate board membership and optional immutable profile pins."""
+    if not profile:
+        return True, "unassigned"
+    name = _canonical_assignee(profile)
+    meta = read_board_metadata(board or get_current_board())
+    policy = meta["policy"]
+    roster = meta["roster"]
+    allowed = set(roster["reviewers"] if role == "reviewer" else roster["workers"])
+    if role == "orchestrator":
+        allowed = {roster["orchestrator"]} if roster["orchestrator"] else set()
+    elif role == "worker" and roster["orchestrator"]:
+        allowed.add(roster["orchestrator"])
+    if not policy["allow_unlisted_profiles"] and name not in allowed:
+        return False, f"profile {name!r} is not in the board {role} roster"
+    if policy["enforce_profile_pins"]:
+        expected = meta.get("profile_pins", {}).get(name)
+        if not isinstance(expected, dict):
+            return False, f"profile {name!r} has no board version pin"
+        current = profile_pin(name)
+        drift = [key for key in ("distribution_version", "definition_sha256") if expected.get(key) != current.get(key)]
+        if drift:
+            return False, f"profile {name!r} drifted from its board pin ({', '.join(drift)})"
+    return True, "allowed"
+
+
+def assert_board_profile_allowed(
+    profile: Optional[str], *, role: str = "worker", board: Optional[str] = None,
+) -> None:
+    ok, reason = board_profile_allowed(profile, role=role, board=board)
+    if not ok:
+        raise ValueError(reason)
+
+
+def verify_board_roster(board: Optional[str] = None) -> dict[str, Any]:
+    slug = _normalize_board_slug(board) or get_current_board()
+    meta = read_board_metadata(slug)
+    roster = meta["roster"]
+    names = set(roster["workers"] + roster["reviewers"])
+    if roster["orchestrator"]:
+        names.add(roster["orchestrator"])
+    available = set(list_profiles_on_disk())
+    profiles = []
+    for name in sorted(names):
+        current = profile_pin(name) if name in available else None
+        expected = meta.get("profile_pins", {}).get(name)
+        profiles.append({
+            "name": name,
+            "exists": name in available,
+            "pin": expected,
+            "current": current,
+            "drifted": bool(expected and current and expected != current),
+        })
+    issues = []
+    if not meta["policy"]["allow_unlisted_profiles"] and not names:
+        issues.append("strict roster is empty")
+    if meta["policy"]["require_review"] and not roster["reviewers"]:
+        issues.append("review is required but the reviewer roster is empty")
+    issues.extend(f"profile {p['name']!r} does not exist" for p in profiles if not p["exists"])
+    issues.extend(f"profile {p['name']!r} has version drift" for p in profiles if p["drifted"])
+    return {"board": slug, "roster": roster, "policy": meta["policy"], "profiles": profiles, "issues": issues, "ok": not issues}
 
 
 def write_board_metadata(
@@ -878,6 +1056,9 @@ def write_board_metadata(
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
+    roster: Optional[Mapping[str, Any]] = None,
+    policy: Optional[Mapping[str, Any]] = None,
+    profile_pins: Optional[Mapping[str, Any]] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -908,6 +1089,12 @@ def write_board_metadata(
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
     if project_id is not None:
         meta["project_id"] = str(project_id) if project_id else None
+    if roster is not None:
+        meta["roster"] = normalize_board_roster(roster)
+    if policy is not None:
+        meta["policy"] = normalize_board_policy(policy)
+    if profile_pins is not None:
+        meta["profile_pins"] = dict(profile_pins)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -1264,6 +1451,7 @@ class Run:
     outcome: Optional[str]
     summary: Optional[str]
     metadata: Optional[dict]
+    provenance: Optional[dict]
     error: Optional[str]
 
     @classmethod
@@ -1272,6 +1460,10 @@ class Run:
             meta = json.loads(row["metadata"]) if row["metadata"] else None
         except Exception:
             meta = None
+        try:
+            provenance = json.loads(row["provenance"]) if "provenance" in row.keys() and row["provenance"] else None
+        except Exception:
+            provenance = None
         return cls(
             id=int(row["id"]),
             task_id=row["task_id"],
@@ -1288,6 +1480,7 @@ class Run:
             outcome=row["outcome"],
             summary=row["summary"],
             metadata=meta,
+            provenance=provenance,
             error=row["error"],
         )
 
@@ -1474,6 +1667,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
+    provenance          TEXT,
     error               TEXT
 );
 
@@ -2718,6 +2912,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+    run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+    if "provenance" not in run_cols:
+        _add_column_if_missing(conn, "task_runs", "provenance", "provenance TEXT")
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -3240,6 +3437,7 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    assert_board_profile_allowed(assignee, role="worker", board=board)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3717,6 +3915,10 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Reassign after the current run completes if needed.
     """
     profile = _canonical_assignee(profile)
+    status_row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if status_row is not None:
+        role = "reviewer" if status_row["status"] == "review" else "worker"
+        assert_board_profile_allowed(profile, role=role)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -4637,6 +4839,11 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    candidate = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if candidate:
+        assert_board_profile_allowed(candidate["assignee"], role="worker")
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -4744,6 +4951,8 @@ def claim_task(
         assignee=claimed.assignee if claimed else None,
         run_id=run_id,
     )
+    if claimed is not None:
+        set_active_run_provenance(conn, claimed)
     return claimed
 
 
@@ -4765,6 +4974,11 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
+    candidate = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if candidate:
+        assert_board_profile_allowed(candidate["assignee"], role="reviewer")
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -4835,7 +5049,10 @@ def claim_review_task(
              "source_status": "review"},
             run_id=run_id,
         )
-        return get_task(conn, task_id)
+        claimed = get_task(conn, task_id)
+    if claimed is not None:
+        set_active_run_provenance(conn, claimed)
+    return claimed
 
 
 def _retry_status_for_run(
@@ -5404,6 +5621,30 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    # Strict boards require an auditable review handoff. Manual approval of a
+    # card already parked in ``review`` remains valid, as does completion by a
+    # run claimed from that lane; an implementation worker cannot jump straight
+    # from its running attempt to done.
+    if read_board_metadata(get_current_board())["policy"]["require_review"]:
+        current = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        from_review_run = False
+        if expected_run_id is not None:
+            event = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+                "AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+                (task_id, int(expected_run_id)),
+            ).fetchone()
+            if event and event["payload"]:
+                try:
+                    from_review_run = json.loads(event["payload"]).get("source_status") == "review"
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    pass
+        if current and current["status"] != "review" and not from_review_run:
+            raise ValueError(
+                "this board requires review; call request_review before completing the task"
+            )
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -6596,7 +6837,16 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
                 reviewer = prior_reviewer
+        if reviewer is None:
+            board_meta = read_board_metadata(get_current_board())
+            board_reviewers = board_meta["roster"]["reviewers"]
+            if board_reviewers:
+                reviewer = board_reviewers[0]
+            elif not board_meta["policy"]["allow_unlisted_profiles"]:
+                return _ret(False, "strict board has no reviewer configured")
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        if reviewer is not None:
+            assert_board_profile_allowed(reviewer, role="reviewer")
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:
@@ -8052,6 +8302,9 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_roster: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks rejected by board membership or version-pin policy, as
+    ``(task_id, reason)`` pairs."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -10122,6 +10375,27 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+        if _default_assignee_resolved:
+            _default_assignee_resolved = board_profile_allowed(
+                _default_assignee, role="worker", board=board,
+            )[0]
+
+    def _record_roster_rejection(task_id: str, profile: str, role: str, reason: str) -> None:
+        """Append only when the rejection changed; dispatcher ticks must not spam."""
+        latest = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'roster_rejected' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        payload = {"profile": profile, "role": role, "reason": reason}
+        if latest and latest["payload"]:
+            try:
+                if json.loads(latest["payload"]) == payload:
+                    return
+            except (json.JSONDecodeError, TypeError):
+                pass
+        with write_txn(conn):
+            _append_event(conn, task_id, "roster_rejected", payload)
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
@@ -10169,6 +10443,16 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        roster_ok, roster_reason = board_profile_allowed(
+            row_assignee, role="worker", board=board,
+        )
+        if not roster_ok:
+            result.skipped_roster.append((row["id"], roster_reason))
+            if not dry_run:
+                _record_roster_rejection(
+                    row["id"], row_assignee, "worker", roster_reason,
+                )
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
@@ -10332,6 +10616,16 @@ def _dispatch_once_locked(
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
+            continue
+        roster_ok, roster_reason = board_profile_allowed(
+            row["assignee"], role="reviewer", board=board,
+        )
+        if not roster_ok:
+            result.skipped_roster.append((row["id"], roster_reason))
+            if not dry_run:
+                _record_roster_rejection(
+                    row["id"], row["assignee"], "reviewer", roster_reason,
+                )
             continue
         try:
             from hermes_cli.profiles import profile_exists
@@ -12001,7 +12295,7 @@ def list_profiles_on_disk() -> list[str]:
     return sorted(names)
 
 
-def known_assignees(conn: sqlite3.Connection) -> list[dict]:
+def known_assignees(conn: sqlite3.Connection, *, board: Optional[str] = None) -> list[dict]:
     """Return every assignee name known to the board or on disk.
 
     Each entry is ``{"name": str, "on_disk": bool, "counts": {status: n}}``.
@@ -12025,7 +12319,15 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     ):
         counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
 
-    names = sorted(on_disk | set(counts.keys()))
+    names_set = on_disk | set(counts.keys())
+    meta = read_board_metadata(board or get_current_board())
+    if not meta["policy"]["allow_unlisted_profiles"]:
+        roster = meta["roster"]
+        allowed = set(roster["workers"] + roster["reviewers"])
+        if roster["orchestrator"]:
+            allowed.add(roster["orchestrator"])
+        names_set &= allowed
+    names = sorted(names_set)
     return [
         {
             "name": name,
@@ -12080,6 +12382,25 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> Optional[Run]:
         "SELECT * FROM task_runs WHERE id = ?", (int(run_id),),
     ).fetchone()
     return Run.from_row(row) if row else None
+
+
+def set_active_run_provenance(conn: sqlite3.Connection, task: Task) -> Optional[dict]:
+    """Persist the exact profile/model/skill snapshot used by this attempt."""
+    if not task.current_run_id or not task.assignee:
+        return None
+    snapshot = profile_provenance(task.assignee, skills=task.skills or ())
+    if task.model_override:
+        snapshot["model"] = {
+            "name": task.model_override,
+            "provider": task.provider_override,
+            "source": "task_override",
+        }
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET provenance = ? WHERE id = ? AND ended_at IS NULL",
+            (json.dumps(snapshot, sort_keys=True), int(task.current_run_id)),
+        )
+    return snapshot
 
 
 def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:

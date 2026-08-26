@@ -231,6 +231,7 @@ def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
         "outcome": r.outcome,
         "summary": r.summary,
         "metadata": r.metadata,
+        "provenance": r.provenance,
         "error": r.error,
     }
 
@@ -499,6 +500,13 @@ def get_board(
                 "AND status != 'archived' ORDER BY assignee"
             )
         ]
+        meta = kanban_db.read_board_metadata(board)
+        if not meta["policy"]["allow_unlisted_profiles"]:
+            roster = meta["roster"]
+            allowed = set(roster["workers"] + roster["reviewers"])
+            if roster["orchestrator"]:
+                allowed.add(roster["orchestrator"])
+            assignees = [name for name in assignees if name in allowed]
 
         return {
             "columns": [
@@ -2230,7 +2238,7 @@ def get_assignees(board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        return {"assignees": kanban_db.known_assignees(conn)}
+        return {"assignees": kanban_db.known_assignees(conn, board=board)}
     finally:
         conn.close()
 
@@ -2372,6 +2380,8 @@ class RenameBoardBody(BaseModel):
     # Project scope (id or slug). ``None`` = leave unchanged; empty = clear;
     # a value = resolve + set (and mirror default_workdir to its primary repo).
     project_id: Optional[str] = None
+    roster: Optional[dict[str, Any]] = None
+    policy: Optional[dict[str, Any]] = None
 
 
 def _resolve_project(ref: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -2562,6 +2572,24 @@ def rename_board(slug: str, payload: RenameBoardBody):
                 default_workdir = primary_path
         else:
             project_id = ""  # clear the scope
+    profile_pins = None
+    if payload.roster is not None:
+        roster = kanban_db.normalize_board_roster(payload.roster)
+        names = set(roster["workers"] + roster["reviewers"])
+        if roster["orchestrator"]:
+            names.add(roster["orchestrator"])
+        available = set(kanban_db.list_profiles_on_disk())
+        missing = sorted(names - available)
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"profiles do not exist: {', '.join(missing)}",
+            )
+        existing_pins = kanban_db.read_board_metadata(normed).get("profile_pins", {})
+        profile_pins = {
+            name: existing_pins.get(name) or kanban_db.profile_pin(name)
+            for name in sorted(names)
+        }
     meta = kanban_db.write_board_metadata(
         normed,
         name=payload.name,
@@ -2570,10 +2598,25 @@ def rename_board(slug: str, payload: RenameBoardBody):
         color=payload.color,
         default_workdir=default_workdir,
         project_id=project_id,
+        roster=payload.roster,
+        policy=payload.policy,
+        profile_pins=profile_pins,
     )
     meta["default_workspace_kind"] = _default_workspace_kind(meta)
     _, meta["project_name"], _ = _resolve_project(meta.get("project_id"))
     return {"board": meta}
+
+
+@router.get("/boards/{slug}/roster")
+def get_board_roster(slug: str):
+    """Return the roster, policy, version pins, and live drift report."""
+    try:
+        normed = kanban_db._normalize_board_slug(slug)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not normed or not kanban_db.board_exists(normed):
+        raise HTTPException(status_code=404, detail=f"board {slug!r} does not exist")
+    return kanban_db.verify_board_roster(normed)
 
 
 @router.delete("/boards/{slug}")

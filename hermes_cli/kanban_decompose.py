@@ -183,6 +183,10 @@ def _resolve_orchestrator_profile(cfg: dict) -> str:
     Falls back to the active default profile when ``kanban.orchestrator_profile``
     is unset, so a task is never stranded for lack of an orchestrator.
     """
+    board_roster = kb.read_board_metadata(kb.get_current_board())["roster"]
+    board_profile = board_roster.get("orchestrator")
+    if board_profile:
+        return board_profile
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get("orchestrator_profile") or "").strip()
     if explicit:
@@ -200,6 +204,11 @@ def _resolve_orchestrator_profile(cfg: dict) -> str:
 
 def _resolve_default_assignee(cfg: dict) -> str:
     """Resolve which profile catches child tasks the orchestrator can't route."""
+    board_meta = kb.read_board_metadata(kb.get_current_board())
+    if not board_meta["policy"]["allow_unlisted_profiles"]:
+        workers = board_meta["roster"]["workers"]
+        if workers:
+            return workers[0]
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get("default_assignee") or "").strip()
     if explicit:
@@ -228,7 +237,16 @@ def _build_roster() -> tuple[list[dict], set[str]]:
     except Exception as exc:
         logger.warning("decompose: failed to list profiles: %s", exc)
         return roster, valid
+    board_meta = kb.read_board_metadata(kb.get_current_board())
+    allowed: Optional[set[str]] = None
+    if not board_meta["policy"]["allow_unlisted_profiles"]:
+        board_roster = board_meta["roster"]
+        allowed = set(board_roster["workers"])
+        if board_roster["orchestrator"]:
+            allowed.add(board_roster["orchestrator"])
     for p in all_profiles:
+        if allowed is not None and p.name not in allowed:
+            continue
         desc = (p.description or "").strip()
         roster.append({
             "name": p.name,

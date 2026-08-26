@@ -32,7 +32,16 @@ import {
 } from '@hermes/plugin-sdk'
 import { useEffect, useState } from 'react'
 
-import { $boardSlug, BOARDS_KEY, createBoard, fetchBoards, fetchProjects, PROJECTS_KEY, updateBoard } from './api'
+import {
+  $boardSlug,
+  BOARDS_KEY,
+  createBoard,
+  fetchBoardRoster,
+  fetchBoards,
+  fetchProjects,
+  PROJECTS_KEY,
+  updateBoard
+} from './api'
 import type { BoardMeta } from './types'
 import { errText, FIELD_LABEL, useKanban } from './ui'
 
@@ -137,21 +146,61 @@ function BoardSettingsDialog({ board, onClose }: { board: BoardMeta | null; onCl
   const qc = useQueryClient()
   const [name, setName] = useState('')
   const [project, setProject] = useState('')
+  const [orchestrator, setOrchestrator] = useState('')
+  const [workers, setWorkers] = useState('')
+  const [reviewers, setReviewers] = useState('')
+  const [strict, setStrict] = useState(false)
+  const [requireReview, setRequireReview] = useState(false)
+  const [enforcePins, setEnforcePins] = useState(false)
+
+  const { data: audit } = useQuery({
+    enabled: Boolean(board),
+    queryFn: () => fetchBoardRoster(board!.slug),
+    queryKey: ['kanban', 'board-roster', board?.slug],
+    staleTime: 15_000
+  })
 
   useEffect(() => {
     if (board) {
       setName(board.name || '')
       setProject(board.project_id || '')
+      setOrchestrator(board.roster?.orchestrator || '')
+      setWorkers((board.roster?.workers || []).join(', '))
+      setReviewers((board.roster?.reviewers || []).join(', '))
+      setStrict(board.policy?.allow_unlisted_profiles === false)
+      setRequireReview(board.policy?.require_review === true)
+      setEnforcePins(board.policy?.enforce_profile_pins === true)
     }
   }, [board])
 
   const save = useMutation({
     // Slug is immutable; send name + project_id ('' clears the scope, which
     // also drops the mirrored default_workdir on the backend).
-    mutationFn: () => updateBoard(board!.slug, { name: name.trim(), project_id: project }),
+    mutationFn: () =>
+      updateBoard(board!.slug, {
+        name: name.trim(),
+        project_id: project,
+        roster: {
+          orchestrator: orchestrator.trim() || null,
+          workers: workers
+            .split(',')
+            .map(value => value.trim())
+            .filter(Boolean),
+          reviewers: reviewers
+            .split(',')
+            .map(value => value.trim())
+            .filter(Boolean)
+        },
+        policy: {
+          allow_unlisted_profiles: !strict,
+          require_review: requireReview,
+          enforce_profile_pins: enforcePins
+        }
+      }),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: BOARDS_KEY })
+      void qc.invalidateQueries({ queryKey: ['kanban', 'board-roster', board!.slug] })
       onClose()
     }
   })
@@ -169,6 +218,63 @@ function BoardSettingsDialog({ board, onClose }: { board: BoardMeta | null; onCl
             {board && <span className="text-[0.6875rem] text-(--ui-text-quaternary)">{k.slug(board.slug)}</span>}
           </label>
           <ProjectPicker onChange={setProject} value={project} />
+          <label className="flex flex-col gap-1">
+            <span className={FIELD_LABEL}>Orchestrator profile</span>
+            <Input
+              onChange={event => setOrchestrator(event.target.value)}
+              placeholder="sellhand-orchestrator"
+              value={orchestrator}
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className={FIELD_LABEL}>Worker profiles</span>
+            <Input
+              onChange={event => setWorkers(event.target.value)}
+              placeholder="software-engineer, content-producer"
+              value={workers}
+            />
+            <span className="text-[0.6875rem] text-(--ui-text-quaternary)">Comma-separated profile names.</span>
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className={FIELD_LABEL}>Reviewer profiles</span>
+            <Input
+              onChange={event => setReviewers(event.target.value)}
+              placeholder="independent-reviewer"
+              value={reviewers}
+            />
+          </label>
+          <label className="flex items-center gap-2 text-[0.75rem]">
+            <input checked={strict} onChange={event => setStrict(event.target.checked)} type="checkbox" />
+            Reject profiles outside this roster
+          </label>
+          <label className="flex items-center gap-2 text-[0.75rem]">
+            <input checked={requireReview} onChange={event => setRequireReview(event.target.checked)} type="checkbox" />
+            Require review before completion
+          </label>
+          <label className="flex items-center gap-2 text-[0.75rem]">
+            <input checked={enforcePins} onChange={event => setEnforcePins(event.target.checked)} type="checkbox" />
+            Block dispatch when profile versions drift
+          </label>
+          {audit && (
+            <div className="rounded-md border border-(--ui-border) p-2 text-[0.6875rem] text-(--ui-text-tertiary)">
+              <div className="mb-1 font-medium">Version audit: {audit.ok ? 'verified' : 'attention required'}</div>
+              {audit.profiles.map(profile => (
+                <div className="flex gap-2" key={profile.name}>
+                  <span>{profile.name}</span>
+                  <span className="ml-auto font-mono text-(--ui-text-quaternary)">
+                    {profile.current?.distribution_version || 'local'} ·{' '}
+                    {(profile.current?.definition_sha256 || '').slice(0, 12)}
+                  </span>
+                  {profile.drifted && <span className="text-destructive">drift</span>}
+                </div>
+              ))}
+              {audit.issues.map(issue => (
+                <div className="text-destructive" key={issue}>
+                  {issue}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
         <DialogFooter>
           <Button onClick={onClose} variant="text">

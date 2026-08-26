@@ -22,6 +22,7 @@ import {
 import { bindCompletionNotify, type CompletionEvent, onKanbanEventsFrame } from './completion-notify'
 import type {
   BoardMeta,
+  BoardRosterReport,
   BoardsResponse,
   KanbanBoard,
   KanbanProfile,
@@ -256,6 +257,8 @@ export const estimateNew = (title: string, body: string) =>
  *  `default_workdir: ''` to clear it. Slug is immutable. */
 export const updateBoard = (slug: string, patch: Record<string, unknown>) =>
   call<{ board: BoardMeta }>(`/boards/${encodeURIComponent(slug)}`, { method: 'PATCH', body: patch })
+
+export const fetchBoardRoster = (slug: string) => call<BoardRosterReport>(`/boards/${encodeURIComponent(slug)}/roster`)
 
 export const nudgeDispatcher = () => call<{ spawned?: unknown[] }>(withBoard('/dispatch'), { method: 'POST', body: {} })
 
