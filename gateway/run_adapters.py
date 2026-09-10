@@ -790,7 +790,10 @@ class GatewayAdapterLifecycleMixin:
         # Rebuild channel directory with the new adapter
         with suppress(Exception):
             from gateway.channel_directory import build_channel_directory
-            await build_channel_directory(self.adapters)
+            await build_channel_directory(
+                self.adapters,
+                profile_adapters=getattr(self, "_profile_adapters", None),
+            )
         # A platform offline at startup skipped its restart-interrupted sessions; resume them now.
         try:
             self._schedule_resume_pending_sessions(platform=platform)

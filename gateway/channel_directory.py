@@ -128,28 +128,41 @@ def _report_slack_failure(team_id: str, error_code: Optional[str], detail: str) 
 
 # --- Build / refresh -------------------------------------------------------
 
-async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
+async def build_channel_directory(
+    adapters: Dict[Any, Any],
+    profile_adapters: Optional[Dict[str, Dict[Any, Any]]] = None,
+) -> Dict[str, Any]:
     """Build the directory from connected adapters + session data and persist it."""
     from gateway.config import Platform
     platforms: Dict[str, List[Dict[str, str]]] = {}
-    for platform, adapter in adapters.items():
+    adapter_items = list(adapters.items())
+    for profile_map in (profile_adapters or {}).values():
+        adapter_items.extend(profile_map.items())
+    for platform, adapter in adapter_items:
         try:
+            platform_channels = None
             list_channels = getattr(adapter, "list_channels", None)
             if callable(list_channels):
                 platform_channels = await list_channels()
-                if platform_channels is not None:
-                    platforms[platform.value] = _normalize_adapter_channels(platform_channels)
-                    continue
-            if platform == Platform.DISCORD:
-                platforms["discord"] = await asyncio.to_thread(_build_discord, adapter)
-            elif platform == Platform.SLACK:
-                platforms["slack"] = await _build_slack(adapter)
+            if platform_channels is None:
+                if platform == Platform.DISCORD:
+                    platform_channels = await asyncio.to_thread(_build_discord, adapter)
+                elif platform == Platform.SLACK:
+                    platform_channels = await _build_slack(adapter)
+            if platform_channels is not None:
+                platform_name = platform.value
+                platforms[platform_name] = _normalize_adapter_channels(
+                    platforms.get(platform_name, []) + platform_channels
+                )
         except Exception as e:
             logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
     # Platforms without channel enumeration get session-based discovery, but only when
     # connected in THIS gateway process: origins for disabled or decommissioned
     # platforms must not resurface as stale send targets.
-    adapter_platform_names = {getattr(p, "value", str(p)) for p in adapters}
+    adapter_platform_names = {
+        getattr(platform, "value", str(platform))
+        for platform, _adapter in adapter_items
+    }
     async def _discover(plat_name: str) -> None:
         if plat_name in _SKIP_SESSION_DISCOVERY or plat_name in platforms or plat_name not in adapter_platform_names:
             return

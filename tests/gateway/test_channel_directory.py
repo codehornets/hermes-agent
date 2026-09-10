@@ -90,6 +90,25 @@ class TestBuildChannelDirectoryWrites:
             {"id": "family_1", "name": "达拉崩吧", "type": "group"},
         ]
 
+    def test_includes_channels_from_secondary_profile_adapters(self, tmp_path):
+        class AdapterWithChannels:
+            async def list_channels(self):
+                return [{"id": "bugs", "name": "sellhand-bugs", "type": "channel"}]
+
+        cache_file = tmp_path / "channel_directory.json"
+        secondary_adapters = {
+            "sellhand-bugs": {Platform.DISCORD: AdapterWithChannels()},
+        }
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            directory = asyncio.run(
+                build_channel_directory({}, profile_adapters=secondary_adapters)
+            )
+
+        assert directory["platforms"]["discord"] == [
+            {"id": "bugs", "name": "sellhand-bugs", "type": "channel"},
+        ]
+
 
 class TestBuildChannelDirectoryOffload:
     def test_discord_builder_runs_off_event_loop_thread(self, tmp_path):

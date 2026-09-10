@@ -1217,7 +1217,10 @@ class GatewayStartupMixin:
         # Initial channel directory for send_message name resolution
         with _log_suppressed(logging.WARNING, "Channel directory build failed: %s"):
             from gateway.channel_directory import build_channel_directory
-            directory = await build_channel_directory(self.adapters)
+            directory = await build_channel_directory(
+                self.adapters,
+                profile_adapters=getattr(self, "_profile_adapters", None),
+            )
             ch_count = sum(len(chs) for chs in directory.get("platforms", {}).values())
             logger.info("Channel directory built: %d target(s)", ch_count)
         # Restarting after a /update still in progress: keep watching so we notify when it finishes.

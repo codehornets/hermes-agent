@@ -4411,13 +4411,13 @@ def _housekeeping_chore(label: str, fn, *args, **kwargs) -> None:
         logger.debug("%s error: %s", label, exc)
 
 
-def _housekeeping_channel_directory(adapters, loop) -> None:
+def _housekeeping_channel_directory(adapters, loop, profile_adapters=None) -> None:
     from gateway.channel_directory import build_channel_directory
     if loop is not None:
         # build_channel_directory is async (Slack web calls) and this is a background thread:
         # schedule onto the gateway loop and wait briefly so refresh failures still log.
         fut = safe_schedule_threadsafe(
-            build_channel_directory(adapters), loop, logger=logger,
+            build_channel_directory(adapters, profile_adapters=profile_adapters), loop, logger=logger,
             log_message="Channel directory refresh scheduling error")
         if fut is not None:
             fut.result(timeout=30)
@@ -4556,7 +4556,10 @@ def _start_gateway_housekeeping(
         chores.append((1, "Cron durable delivery queue drain",
                        lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner)))
     chores += [
-        (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop)),
+        (5, "Channel directory refresh", lambda: (adapters or getattr(runner, "_profile_adapters", None)) and
+         _housekeeping_channel_directory(
+             adapters or {}, loop, getattr(runner, "_profile_adapters", None)
+         )),
         (60, "Media cache cleanup", _housekeeping_media_caches),
         (60, "Paste sweep", _housekeeping_paste_sweep)]
     if cron_provider is not None:
