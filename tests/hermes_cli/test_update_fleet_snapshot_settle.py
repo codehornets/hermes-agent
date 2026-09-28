@@ -52,8 +52,37 @@ def test_snapshot_waits_for_late_current_gateway_state(monkeypatch) -> None:
     assert clock.now <= update_cmd_fleet._FLEET_PROBE_SETTLE_TIMEOUT_SECONDS
 
 
+def test_snapshot_waits_for_large_multiplex_gateway_boot(monkeypatch) -> None:
+    """A large multiplexed gateway can answer only after the ordinary restart wait budget."""
+    clock = _FakeClock()
+    expected = {"profile": "default", "pid": 202, "code_sha": "new", "state": "current"}
+    snapshots = iter([[]] * 80 + [[expected]])
+
+    monkeypatch.setattr(update_cmd_fleet._time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(update_cmd_fleet._time, "sleep", clock.sleep)
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **_kwargs: next(snapshots),
+    )
+    monkeypatch.setattr(
+        update_cmd_fleet,
+        "_systemctl",
+        lambda cmd, *, timeout: SimpleNamespace(
+            stdout="LoadState=loaded\nActiveState=active\n", stderr="", returncode=0
+        ),
+    )
+
+    restart = SimpleNamespace(pre_restart_gateway_pids=[101], restarted_scoped_units={"user/hermes-gateway.service"})
+
+    result = update_cmd_fleet._collect_fleet_snapshot(restart, rows_expected=True)
+
+    assert result == [expected]
+    assert clock.now > 155.0
+    assert clock.now <= update_cmd_fleet._FLEET_PROBE_SETTLE_TIMEOUT_SECONDS
+
+
 def test_snapshot_stops_waiting_once_the_restarted_unit_is_dead(monkeypatch) -> None:
-    """A successor that exits (unit failed/inactive) fails closed at once, not at the 120s deadline."""
+    """A successor that exits (unit failed/inactive) fails closed at once, not at the settle deadline."""
     clock = _FakeClock()
     monkeypatch.setattr(update_cmd_fleet._time, "monotonic", clock.monotonic)
     monkeypatch.setattr(update_cmd_fleet._time, "sleep", clock.sleep)

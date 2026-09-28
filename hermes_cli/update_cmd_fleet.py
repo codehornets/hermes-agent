@@ -31,9 +31,11 @@ _FLEET_RESTART_PENDING_NAME = "fleet_restart_pending"
 _FRESH_RESTART_SUPERVISORS = frozenset({"systemd", "launchd", "service", "s6"})
 
 # A supervisor can report a restarted unit active before the gateway finishes its
-# bootstrap and publishes ``gateway_state.json``. Keep the readiness poll bounded,
-# but allow the default systemd startup budget plus status-publication slack.
-_FLEET_PROBE_SETTLE_TIMEOUT_SECONDS = 120.0
+# bootstrap, opens the control socket, and publishes ``gateway_state.json``. Large
+# multiplexed installs can spend several minutes restoring all served profiles, so
+# keep the readiness poll bounded but do not fail the update before the gateway has
+# had a realistic chance to publish a fleet identity.
+_FLEET_PROBE_SETTLE_TIMEOUT_SECONDS = 300.0
 
 _SYSTEMD_SCOPES = (("user", ["systemctl", "--user"]), ("system", ["systemctl"]))
 _LIST_GATEWAY_UNITS = [

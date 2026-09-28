@@ -1302,6 +1302,32 @@ def _read_gateway_runtime_status() -> dict | None:
     return state if isinstance(state, dict) else None
 
 
+def _control_socket_runtime_status() -> dict | None:
+    """Live gateway identity from the control socket, shaped like runtime status."""
+    try:
+        from gateway.control_socket import identify_gateway
+        from hermes_constants import get_hermes_home
+
+        identity = identify_gateway(get_hermes_home())
+    except Exception:
+        return None
+    if not isinstance(identity, dict):
+        return None
+    try:
+        pid = int(identity.get("pid") or 0)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    return {
+        "pid": pid,
+        "gateway_state": "running",
+        "code_sha": identity.get("code_sha"),
+        "code_version": identity.get("code_version"),
+        "served_profiles": identity.get("served_profiles"),
+    }
+
+
 def _systemd_cli_bits(system: bool) -> tuple[str, str, str]:
     """``(sudo_prefix, scope_flag, user_flag)`` for printed hints: ``("sudo ", " --system", "")`` in
     system scope, ``("", "", "--user ")`` in user scope."""
@@ -1349,6 +1375,15 @@ def _wait_for_systemd_service_restart(
                 runtime_state = _read_gateway_runtime_status()
                 if runtime_state and _runtime_state_pid(runtime_state) != new_pid:
                     runtime_state = None
+            gateway_state = (runtime_state or {}).get("gateway_state")
+            if (
+                not runtime_state
+                or _runtime_state_pid(runtime_state) != new_pid
+                or gateway_state not in ("running", "degraded", "startup_failed")
+            ):
+                socket_state = _control_socket_runtime_status()
+                if _runtime_state_pid(socket_state) == new_pid:
+                    runtime_state = socket_state
             gateway_state = (runtime_state or {}).get("gateway_state")
             if gateway_state in ("running", "degraded"):
                 print(f"✓ {scope_label} service restarted (PID {new_pid})")
@@ -5745,4 +5780,3 @@ def _pm_runtime_venv_dir(project_root: Path | None = None) -> Path | None:
 
     venv = selected_venv(root)  # a malformed committed selection raises: fail closed
     return venv if venv.is_dir() else None
-
