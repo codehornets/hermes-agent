@@ -11,6 +11,7 @@ __pycache__/
 hermes_cli/_version.py
 act/
 .act-sandbox-agent.*
+.omc/
 .venv/
 .venv
 .vscode/
