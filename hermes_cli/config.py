@@ -46,7 +46,7 @@ from hermes_constants import (  # noqa: F401
     apply_secure_dir_policy, get_managed_system)
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F401
-from utils import atomic_replace, fast_safe_load, file_signature
+from utils import atomic_replace, fast_safe_load, file_signature, mkstemp_beside
 from hermes_cli.config_read_errors import (
     _CONFIG_PARSE_FAILURES, _FIX_PERMS, _FIX_YAML, FailedConfigRead, _backups_dir_display,
     _refuse_failed_read, _refuse_overwrite, _warn_config_parse_failure, _yaml_error_details,
@@ -2628,7 +2628,7 @@ def _write_env_lines(env_path: Path, lines: list, *, preserve_mode: bool) -> Non
         original_mode = stat.S_IMODE(env_path.stat().st_mode) if preserve_mode else None
     except OSError:
         pass
-    fd, tmp_path = tempfile.mkstemp(dir=str(env_path.parent), suffix=".tmp", prefix=".env_")
+    fd, tmp_path = mkstemp_beside(env_path, suffix=".tmp", prefix=".env_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.writelines(lines)
@@ -3380,8 +3380,12 @@ def _coerce_config_set_value(key: str, value: str) -> Any:
     """Auto-coerce a ``hermes config set`` string to bool/None/int/float/list/dict.
     String-typed settings (per ``DEFAULT_CONFIG``) are preserved verbatim so enum members such as
     ``approvals.mode="off"`` never become booleans. List/mapping literals are parsed so
-    isinstance-gated readers see real structures; the trigger is conservative."""
-    if isinstance(_default_value_for_key(key), str):
+    isinstance-gated readers see real structures; the trigger is conservative.
+    Bare ``model`` is the exception: its string default is the model-id shorthand, so a structured
+    literal there is parsed for the section guard to gate instead of riding into model.default
+    as a bogus id (#131435)."""
+    if isinstance(_default_value_for_key(key), str) and not (
+            key == "model" and _looks_structured_value(value)):
         return value
     stripped = value.strip()
     lower = stripped.lower()
@@ -3522,42 +3526,6 @@ def _exit_if_key_managed(key: str, action: str) -> None:
         sys.exit(1)
 
 
-def _guard_section_overwrite(key: str, value: Any, user_config: Dict[str, Any], force: bool) -> str:
-    """Refuse (or with ``force`` allow) a single-segment key overwriting a mapping with a scalar.
-    Bare ``model`` is a documented shorthand — redirected to ``model.default`` so siblings survive.
-    Returns the (possibly redirected) key."""
-    existing = user_config.get(key)
-    if "." in key or not isinstance(existing, dict):
-        return key
-    if key == "model":
-        if force:
-            print(
-                f"⚠ Replacing entire 'model' section with a scalar "
-                f"(discarding {len(existing)} existing sub-key(s))")
-            return key
-        print(
-            f"✓ Redirecting bare 'model' to 'model.default' "
-            f"(preserving {len(existing)} existing model sub-key(s))")
-        return "model.default"
-    if force:
-        return key
-    sub = [k for k in existing if isinstance(k, str)]
-    err = [
-        f"✗ Cannot set '{key}' to a scalar — '{key}' is a "
-        f"configuration section with {len(sub)} sub-key(s)."]
-    if sub:
-        err.append(f"  Sub-keys: {', '.join(sub[:8])}")
-        if len(sub) > 8:
-            err.append(f"  ... and {len(sub) - 8} more")
-    err += [
-        "  Use a dotted path to set a specific leaf key:",
-        f"    hermes config set {key}.<sub-key> <value>",
-        "  Or use --force to replace the entire section:",
-        f"    hermes config set --force {key} {value!r}"]
-    print("\n".join(err), file=sys.stderr)
-    sys.exit(1)
-
-
 def _touch_skin_file(key: str, value: Any) -> None:
     """``display.skin`` set means "apply NOW": bump the skin file's mtime so the gateway watcher's
     (name, mtime) signature moves even when the name is unchanged. Best-effort."""
@@ -3679,6 +3647,7 @@ def set_config_value(key: str, value: str, force: bool = False):
     _model_val = user_config.get("model")
     if key.strip().lower().startswith("model.") and isinstance(_model_val, str) and _model_val:
         user_config["model"] = {"default": _model_val}
+    from hermes_cli.config_section_guard import _guard_section_overwrite
     key = _guard_section_overwrite(key, value, user_config, force)
     value = _refuse_container_type_mismatch(key, value, user_config, force)
     _old_provider = _model_val.get("provider") if isinstance(_model_val, dict) else None
