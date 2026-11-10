@@ -132,6 +132,12 @@ desktop-build:
 tui:
     pnpm --dir ui-tui run dev
 
+# Start/stop/restart/status/logs of the Hermes gateway service from this checkout
+[group('dev')]
+[positional-arguments]
+service action:
+    scripts/hermes-service "$@"
+
 # Run a command against a throwaway HERMES_HOME (scripts/dev-sandbox.sh)
 [group('dev')]
 [positional-arguments]

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Start/stop the Hermes gateway service from this checkout, from any cwd:
+#   scripts/hermes-service start|stop|restart|status|logs
+# The unit runs this repo's .hermes/bin/hermes (`hermes gateway install` writes it).
+set -eu
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+case "${1:-}" in
+  start|stop|restart|status) exec "$here/run-in-hermes-env" "$here/../.hermes/bin/hermes" gateway "$1" ;;
+  logs) exec journalctl --user -u hermes-gateway -f ;;
+  *) echo "usage: $0 start|stop|restart|status|logs" >&2; exit 2 ;;
+esac
