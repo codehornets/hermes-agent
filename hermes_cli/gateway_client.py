@@ -17,6 +17,18 @@ GATEWAY_WS_TICKET_PREFIX = "hermes-gateway-ticket."
 # Per-request answer budget. Owner verbs are admissions/reads that answer promptly; the one that
 # legitimately runs long passes its own budget (``rpc(..., _timeout=...)``).
 DEFAULT_RPC_TIMEOUT = 30
+# Websocket handshake budget. On an oversubscribed host (load well above the core count) a healthy
+# gateway answers the handshake late; the budget grows with the load ratio, up to the cap.
+OPEN_TIMEOUT_BASE = 10.0
+OPEN_TIMEOUT_MAX = 60.0
+
+
+def _open_timeout() -> float:
+    try:
+        ratio = os.getloadavg()[0] / (os.cpu_count() or 1)
+    except (AttributeError, OSError):  # no loadavg on this platform
+        return OPEN_TIMEOUT_BASE
+    return min(OPEN_TIMEOUT_MAX, max(OPEN_TIMEOUT_BASE, OPEN_TIMEOUT_BASE * ratio))
 # A typed ``--api-key`` on a resume that the owner does not bind (``rebind_launch_key``): every CLI says this.
 RESUME_KEY_MISMATCH = ("--api-key on resume must be the key this session was launched with "
                        "(a session launched without --api-key keeps its profile credentials). "
@@ -370,7 +382,7 @@ async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 10
         # The gateway is a loopback (or explicitly named) peer, never something to route through the
         # user's HTTP(S) proxy; websockets>=14 reads HTTP_PROXY/HTTPS_PROXY by default and a proxy that
         # cannot reach 127.0.0.1 turns every launch into a 10 s open timeout.
-        async with connect(url, subprotocols=protocols, open_timeout=10, max_size=max_size,
+        async with connect(url, subprotocols=protocols, open_timeout=_open_timeout(), max_size=max_size,
                            proxy=None) as ws:
             if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
                 raise GatewayClientError("Gateway protocol mismatch; update/restart required")
